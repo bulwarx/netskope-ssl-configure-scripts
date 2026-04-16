@@ -47,10 +47,20 @@ if %certBundleExists%==1 (
     curl -k -L "https://ccadb.my.salesforce-sites.com/mozilla/IncludedRootsPEMTxt?TrustBitsInclude=Websites" >> "%certDir%\%certName%"
 )
 
+:: Ask whether to create a replay script
+set createReplay=n
+set /p createReplay="Create replay script (configured_tools.bat)? [y/N]: "
+if /i "%createReplay%"=="y" (
+    echo @echo off > "%~dp0configured_tools.bat"
+    echo Replay script: %~dp0configured_tools.bat
+)
+
 :: Tools configuration (add more tools here as needed)
 
-:: Initialize configured tools file
-echo @echo off > configured_tools.bat
+:: Windows Certificate Store
+echo.
+echo Windows Certificate Store:
+powershell -NoProfile -Command "$cr='%createReplay%'; $certContent = Get-Content '%certDir%\%certName%' -Raw; if ($certContent -match '-----BEGIN CERTIFICATE-----\s*([\s\S]*?)\s*-----END CERTIFICATE-----') { $b64 = $Matches[1] -replace '\s',''; try { $x509 = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(,[Convert]::FromBase64String($b64)); $thumb = $x509.Thumbprint; $inStore = @(Get-ChildItem Cert:\LocalMachine\Root, Cert:\CurrentUser\Root -ErrorAction SilentlyContinue | Where-Object { $_.Thumbprint -eq $thumb }).Count -gt 0; if ($inStore) { Write-Host '  already configured (certificate found in store)' } else { Write-Host '  importing certificate...'; $r = certutil -addstore -f Root '%certDir%\%certName%' 2>&1; if ($LASTEXITCODE -eq 0) { Write-Host '  configured (imported into LocalMachine\Root)'; if ($cr -ieq 'y') { Add-Content -Path configured_tools.bat -Value 'certutil -addstore -f Root \"%certDir%\%certName%\"' } } else { $r2 = certutil -addstore -f -user Root '%certDir%\%certName%' 2>&1; if ($LASTEXITCODE -eq 0) { Write-Host '  configured (imported into CurrentUser\Root)'; if ($cr -ieq 'y') { Add-Content -Path configured_tools.bat -Value 'certutil -addstore -f -user Root \"%certDir%\%certName%\"' } } else { Write-Host '  access denied - rerun as Administrator to import into machine store' } } } } catch { Write-Host ('  could not check certificate store: ' + $_) } } else { Write-Host '  no PEM certificate found in bundle' }"
 
 echo.
 call :command_exists git
@@ -68,8 +78,8 @@ if %ERRORLEVEL% EQU 0 (
     echo --ca-native > %HOMEPATH%\.curlrc
 	echo --ssl-revoke-best-effort >> %HOMEPATH%\.curlrc
     echo cURL
-    echo echo --ca-native ^> %%HOMEPATH%%\.curlrc >> configured_tools.bat
-	echo echo --ssl-revoke-best-effort ^>^> %%HOMEPATH%%\.curlrc >> configured_tools.bat
+    if /i "%createReplay%"=="y" echo echo --ca-native ^> %%HOMEPATH%%\.curlrc >> configured_tools.bat
+	if /i "%createReplay%"=="y" echo echo --ssl-revoke-best-effort ^>^> %%HOMEPATH%%\.curlrc >> configured_tools.bat
 ) else (
     echo cURL is not installed
 )
@@ -84,7 +94,7 @@ if "%REQUESTS_CA_BUNDLE%"=="%certDir%\%certName%" (
 ) else (
     setx REQUESTS_CA_BUNDLE "%certDir%\%certName%"
     echo Python Requests Library Configured
-    echo setx REQUESTS_CA_BUNDLE "%certDir%\%certName%" >> configured_tools.bat
+    if /i "%createReplay%"=="y" echo setx REQUESTS_CA_BUNDLE "%certDir%\%certName%" >> configured_tools.bat
 )
 
 echo.
@@ -98,7 +108,7 @@ if %ERRORLEVEL% EQU 0 (
     gcloud --version
     gcloud config set core/custom_ca_certs_file %certDir%\%certName%
     echo Google Cloud CLI Configured
-    echo gcloud config set core/custom_ca_certs_file %certDir%\%certName% >> configured_tools.bat
+    if /i "%createReplay%"=="y" echo gcloud config set core/custom_ca_certs_file %certDir%\%certName% >> configured_tools.bat
 ) else (
     echo Google Cloud CLI is not installed
 )
@@ -110,7 +120,7 @@ if %ERRORLEVEL% EQU 0 (
     npm --version
     npm config set cafile %certDir%\%certName%
     echo "NodeJS Package Manager (NPM) Configured"
-    echo npm config set cafile %certDir%\%certName% >> configured_tools.bat
+    if /i "%createReplay%"=="y" echo npm config set cafile %certDir%\%certName% >> configured_tools.bat
 ) else (
     echo "NodeJS Package Manager (NPM) is not installed"
 )
@@ -130,7 +140,7 @@ if %ERRORLEVEL% EQU 0 (
     composer --version
     composer config --global cafile %certDir%\%certName%
     echo PHP Composer Configured
-    echo composer config --global cafile %certDir%\%certName% >> configured_tools.bat
+    if /i "%createReplay%"=="y" echo composer config --global cafile %certDir%\%certName% >> configured_tools.bat
 ) else (
     echo PHP Composer is not installed
 )
@@ -164,7 +174,7 @@ if %ERRORLEVEL% EQU 0 (
         echo Cargo Package Manager Already configured 1/2
     ) else (
         setx SSL_CERT_FILE "%certDir%\%certName%"
-        echo setx SSL_CERT_FILE "%certDir%\%certName%" >> configured_tools.bat
+        if /i "%createReplay%"=="y" echo setx SSL_CERT_FILE "%certDir%\%certName%" >> configured_tools.bat
     )
     set GIT_SSL_CAPATH=
     for /f "tokens=*" %%P in ('cargo --version') do (
@@ -174,7 +184,7 @@ if %ERRORLEVEL% EQU 0 (
         echo Cargo Package Manager Already configured 2/2
     ) else (
         setx GIT_SSL_CAPATH "%certDir%\%certName%"
-        echo setx GIT_SSL_CAPATH "%certDir%\%certName%" >> configured_tools.bat
+        if /i "%createReplay%"=="y" echo setx GIT_SSL_CAPATH "%certDir%\%certName%" >> configured_tools.bat
     )
     echo Cargo Package Manager configured
 ) else (
@@ -188,10 +198,61 @@ if %ERRORLEVEL% EQU 0 (
     yarn --version
     yarn config set cafile %certDir%\%certName%
     echo Yarn Configured
-    echo yarn config set cafile %certDir%\%certName% >> configured_tools.bat
+    if /i "%createReplay%"=="y" echo yarn config set cafile %certDir%\%certName% >> configured_tools.bat
 ) else (
     echo Yarn is not installed
 )
+
+:: Java JDK
+echo.
+echo Java installations:
+powershell -NoProfile -Command "$storepass='changeit'; $certPath='%certDir%\%certName%'; $certText=Get-Content $certPath -Raw; $pemBlocks=[regex]::Matches($certText,'-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----') | Select-Object -First 2; function Get-AllJDKs { $found=@{}; function Add-JDK($home,$label){ if(-not $home -or -not (Test-Path $home)){return}; $kt=Join-Path $home 'bin\keytool.exe'; if((Test-Path $kt)-and-not $found.Contains($home.ToLower())){ $found[$home.ToLower()]=@($home,$label) } }; if($env:JAVA_HOME){Add-JDK $env:JAVA_HOME 'JAVA_HOME'}; $ktCmd=Get-Command keytool -ErrorAction SilentlyContinue; if($ktCmd){Add-JDK (Split-Path (Split-Path $ktCmd.Source)) 'PATH'}; @('HKLM:\SOFTWARE\JavaSoft\JDK','HKLM:\SOFTWARE\WOW6432Node\JavaSoft\JDK')|ForEach-Object{ if(Test-Path $_){ Get-ChildItem $_ -ErrorAction SilentlyContinue|ForEach-Object{ $jh=(Get-ItemProperty $_.PSPath -Name JavaHome -ErrorAction SilentlyContinue).JavaHome; if($jh){Add-JDK $jh ('Registry ('+$_.PSChildName+')')} } } }; @('Java','Eclipse Adoptium','Amazon Corretto','Zulu','Microsoft')|ForEach-Object{ $p=Join-Path $env:ProgramFiles $_; if(Test-Path $p){ Get-ChildItem $p -Directory -ErrorAction SilentlyContinue|ForEach-Object{ Add-JDK $_.FullName ('Common ('+$_.Name+')') } } }; return $found.Values }; $allJDKs=@(Get-AllJDKs); if($allJDKs.Count -eq 0){ Write-Host '  No Java installations found' } else { foreach($entry in $allJDKs){ $home=$entry[0]; $label=$entry[1]; Write-Host ('  ['+$label+'] '+$home); $cacerts=Join-Path $home 'lib\security\cacerts'; if(-not(Test-Path $cacerts)){ $cacerts=Join-Path $home 'jre\lib\security\cacerts' }; if(-not(Test-Path $cacerts)){ Write-Host '    cacerts: not found'; continue }; $keytool=Join-Path $home 'bin\keytool.exe'; for($i=0;$i -lt $pemBlocks.Count;$i++){ $alias='netskope-'+$i; & $keytool -list -alias $alias -keystore $cacerts -storepass $storepass *>$null; if($LASTEXITCODE -eq 0){ Write-Host ('    keytool alias '+$alias+': already configured') } else { $tmp=[IO.Path]::GetTempFileName()+'.pem'; try { [IO.File]::WriteAllText($tmp,$pemBlocks[$i].Value); & $keytool -import -trustcacerts -noprompt -alias $alias -file $tmp -keystore $cacerts -storepass $storepass *>$null; if($LASTEXITCODE -eq 0){ Write-Host ('    keytool alias '+$alias+': configured') } else { Write-Host ('    keytool alias '+$alias+': failed') } } catch [System.UnauthorizedAccessException]{ Write-Host '    keytool: access denied - rerun as Administrator' } finally { if(Test-Path $tmp){ Remove-Item $tmp -Force } } } } } }"
+
+:: VS Code
+echo.
+echo VS Code:
+powershell -NoProfile -Command "@(@{Dir=($env:APPDATA+'\Code\User');Edition='VS Code'},@{Dir=($env:APPDATA+'\Code - Insiders\User');Edition='VS Code Insiders'})|ForEach-Object{ $dir=$_.Dir; $edition=$_.Edition; $sf=Join-Path $dir 'settings.json'; if(-not(Test-Path $dir)){return}; try{ if(Test-Path $sf){ $s=Get-Content $sf -Raw|ConvertFrom-Json } else { $s=New-Object PSObject }; if($s.PSObject.Properties['http.systemCertificates'] -and $s.'http.systemCertificates' -eq $true){ Write-Host ('  '+$edition+': already configured') } else { $s|Add-Member -NotePropertyName 'http.systemCertificates' -NotePropertyValue $true -Force; $s|ConvertTo-Json -Depth 10|Set-Content $sf -Encoding UTF8; Write-Host ('  '+$edition+': configured') } } catch { Write-Host ('  '+$edition+': failed - '+$_) } }; if(-not(Test-Path ($env:APPDATA+'\Code\User'))-and-not(Test-Path ($env:APPDATA+'\Code - Insiders\User'))){ Write-Host '  VS Code is not installed' }"
+
+:: .NET / NuGet
+echo.
+echo .NET / NuGet:
+set dotnetFound=0
+where dotnet >NUL 2>&1
+if %ERRORLEVEL% EQU 0 (
+    echo   dotnet is installed - covered by Windows Certificate Store
+    if /i "%createReplay%"=="y" echo # dotnet: covered by Windows Certificate Store >> configured_tools.bat
+    set dotnetFound=1
+)
+where nuget >NUL 2>&1
+if %ERRORLEVEL% EQU 0 (
+    echo   nuget is installed - covered by Windows Certificate Store
+    if /i "%createReplay%"=="y" echo # nuget: covered by Windows Certificate Store >> configured_tools.bat
+    set dotnetFound=1
+)
+if "%dotnetFound%"=="0" echo   .NET / NuGet is not installed
+
+:: Docker Desktop
+echo.
+echo Docker Desktop:
+set dockerInstalled=0
+where docker >NUL 2>&1
+if %ERRORLEVEL% EQU 0 set dockerInstalled=1
+if "%dockerInstalled%"=="0" if exist "%LOCALAPPDATA%\Docker\Desktop" set dockerInstalled=1
+if "%dockerInstalled%"=="0" (
+    echo   Docker is not installed
+    goto :after_docker
+)
+fc /b "%USERPROFILE%\.docker\ca.pem" "%certDir%\%certName%" >NUL 2>&1
+if %ERRORLEVEL% EQU 0 (
+    echo   already configured
+    goto :after_docker
+)
+if not exist "%USERPROFILE%\.docker" mkdir "%USERPROFILE%\.docker"
+copy /y "%certDir%\%certName%" "%USERPROFILE%\.docker\ca.pem" >NUL
+echo   configured (%USERPROFILE%\.docker\ca.pem)
+echo   Note: restart Docker Desktop to apply changes
+if /i "%createReplay%"=="y" echo copy /y "%certDir%\%certName%" "%USERPROFILE%\.docker\ca.pem" >> configured_tools.bat
+:after_docker
 
 :: Function to check if a command exists
 :command_exists
@@ -218,7 +279,7 @@ if "%toolConfigured%"=="%certDir%\%certName%" (
     %~3 "%certDir%\%certName%"
     echo %~1 Configured
     echo %~1 Configured
-    echo %~4 >> configured_tools.bat
+    if /i "%createReplay%"=="y" echo %~4 >> configured_tools.bat
 )
 exit /b 0
 :: How to add a new tool:

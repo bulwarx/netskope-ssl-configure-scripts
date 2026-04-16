@@ -6,7 +6,7 @@
     Prompts for tenant details, downloads the certificate bundle, then patches every
     Python installation found (certifi + pip), sets persistent environment variables,
     and runs tool-specific config commands for Git, cURL, Node, AWS CLI, gcloud, etc.
-    Writes a configured_tools.ps1 replay script in the current directory.
+    Optionally writes a configured_tools.ps1 replay script in the current directory.
 #>
 
 # ─── TLS bypass for initial download (cert not trusted yet) ──────────────────
@@ -36,10 +36,10 @@ function Set-PersistentEnvVar($name, $value) {
     Set-Item -Path "Env:\$name" -Value $value -ErrorAction SilentlyContinue
 }
 
-$configuredToolsFile = Join-Path (Get-Location).Path 'configured_tools.ps1'
+$configuredToolsFile = Join-Path $PSScriptRoot 'configured_tools.ps1'
 
 function Add-Replay($line) {
-    Add-Content -Path $configuredToolsFile -Value $line
+    if ($createReplay) { Add-Content -Path $configuredToolsFile -Value $line }
 }
 
 # ─── User inputs ──────────────────────────────────────────────────────────────
@@ -91,14 +91,60 @@ function New-CertBundle {
     Write-Host "Cert bundle saved: $certPath"
 }
 
-Set-Content -Path $configuredToolsFile -Value '# Netskope SSL configuration - replay script'
-
 if (Test-Path $certPath) {
     Write-Host "$certName already exists in $certDir."
     $recreate = Read-Host 'Recreate Certificate Bundle? (y/N)'
     if ($recreate -ieq 'y') { New-CertBundle }
 } else {
     New-CertBundle
+}
+
+$createReplay = (Read-Host 'Create replay script (configured_tools.ps1)? [y/N]') -ieq 'y'
+if ($createReplay) {
+    Set-Content -Path $configuredToolsFile -Value '# Netskope SSL configuration - replay script'
+    Write-Host "Replay script: $configuredToolsFile"
+}
+
+# ─── Windows Certificate Store ───────────────────────────────────────────────
+
+Write-Host ""
+Write-Host "Windows Certificate Store:"
+
+# Extract first PEM block and check thumbprint
+$certContent = Get-Content $certPath -Raw -ErrorAction SilentlyContinue
+if ($certContent -match '-----BEGIN CERTIFICATE-----\s*([\s\S]*?)\s*-----END CERTIFICATE-----') {
+    $b64 = $Matches[1] -replace '\s', ''
+    try {
+        $x509 = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
+            ,[Convert]::FromBase64String($b64))
+        $thumb = $x509.Thumbprint
+        $inStore = @(
+            Get-ChildItem Cert:\LocalMachine\Root, Cert:\CurrentUser\Root -ErrorAction SilentlyContinue |
+            Where-Object { $_.Thumbprint -eq $thumb }
+        ).Count -gt 0
+        if ($inStore) {
+            Write-Host "  already configured (certificate found in store)"
+        } else {
+            Write-Host "  importing certificate into Windows store..."
+            $addMachine = certutil -addstore -f Root $certPath 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "  configured (imported into LocalMachine\Root)"
+                Add-Replay "certutil -addstore -f Root `"$certPath`""
+            } else {
+                $addUser = certutil -addstore -f -user Root $certPath 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host "  configured (imported into CurrentUser\Root)"
+                    Add-Replay "certutil -addstore -f -user Root `"$certPath`""
+                } else {
+                    Write-Host "  access denied - rerun as Administrator to import into machine store"
+                }
+            }
+        }
+    } catch {
+        Write-Host "  could not check certificate store: $_"
+    }
+} else {
+    Write-Host "  no PEM certificate found in bundle"
 }
 
 # ─── Python: find all installations ──────────────────────────────────────────
@@ -334,8 +380,191 @@ if (Test-Path $storageExplorerCerts) {
     Add-Replay "Copy-Item -Path `"$certPath`" -Destination `"$storageExplorerCerts`" -Force"
 } else { Write-Host "Azure Storage Explorer is not installed" }
 
+# ─── Java JDK ────────────────────────────────────────────────────────────────
+
+function Get-AllJDKs {
+    $found = [ordered]@{}  # normcase(home) => @(home, label)
+
+    function Add-JDK($home, $label) {
+        if (-not $home -or -not (Test-Path $home -PathType Container)) { return }
+        $keytool = Join-Path $home 'bin\keytool.exe'
+        if ((Test-Path $keytool) -and -not $found.Contains($home.ToLower())) {
+            $found[$home.ToLower()] = @($home, $label)
+        }
+    }
+
+    # JAVA_HOME
+    if ($env:JAVA_HOME) { Add-JDK $env:JAVA_HOME 'JAVA_HOME' }
+
+    # keytool on PATH
+    $kt = Get-Command keytool -ErrorAction SilentlyContinue
+    if ($kt) { Add-JDK (Split-Path (Split-Path $kt.Source)) 'PATH' }
+
+    # Registry
+    @(
+        'HKLM:\SOFTWARE\JavaSoft\JDK',
+        'HKLM:\SOFTWARE\WOW6432Node\JavaSoft\JDK'
+    ) | ForEach-Object {
+        if (Test-Path $_) {
+            Get-ChildItem $_ -ErrorAction SilentlyContinue | ForEach-Object {
+                $javaHome = (Get-ItemProperty $_.PSPath -Name JavaHome -ErrorAction SilentlyContinue).JavaHome
+                if ($javaHome) { Add-JDK $javaHome "Registry ($($_.PSChildName))" }
+            }
+        }
+    }
+
+    # Common install directories
+    $progFiles = $env:ProgramFiles
+    @('Java','Eclipse Adoptium','Amazon Corretto','Zulu','Microsoft') | ForEach-Object {
+        $parent = Join-Path $progFiles $_
+        if (Test-Path $parent) {
+            Get-ChildItem $parent -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+                Add-JDK $_.FullName "Common ($($_.Name))"
+            }
+        }
+    }
+
+    return $found.Values
+}
+
+function Configure-JavaSSL($jdkHome, $label) {
+    Write-Host ""
+    Write-Host "  [$label] $jdkHome"
+
+    $cacerts = Join-Path $jdkHome 'lib\security\cacerts'
+    if (-not (Test-Path $cacerts)) { $cacerts = Join-Path $jdkHome 'jre\lib\security\cacerts' }
+    if (-not (Test-Path $cacerts)) { Write-Host "    cacerts: not found"; return }
+
+    $keytool   = Join-Path $jdkHome 'bin\keytool.exe'
+    $storepass = 'changeit'
+
+    # Extract first 2 PEM blocks only (Netskope CA + org cert, not Mozilla bundle)
+    $certText  = Get-Content $certPath -Raw
+    $pemBlocks = [regex]::Matches($certText, '-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----') |
+                 Select-Object -First 2
+
+    if ($pemBlocks.Count -eq 0) { Write-Host "    keytool: no PEM blocks found in bundle"; return }
+
+    for ($i = 0; $i -lt $pemBlocks.Count; $i++) {
+        $alias = "netskope-$i"
+        & $keytool -list -alias $alias -keystore $cacerts -storepass $storepass *>$null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "    keytool alias ${alias}: already configured"
+            continue
+        }
+        $tmp = [IO.Path]::GetTempFileName() + '.pem'
+        try {
+            [IO.File]::WriteAllText($tmp, $pemBlocks[$i].Value)
+            & $keytool -import -trustcacerts -noprompt -alias $alias -file $tmp `
+                       -keystore $cacerts -storepass $storepass *>$null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "    keytool alias ${alias}: configured"
+                Add-Replay "# Java keytool import for $jdkHome alias $alias"
+                Add-Replay "`"$keytool`" -import -trustcacerts -noprompt -alias $alias -file `"$certPath`" -keystore `"$cacerts`" -storepass $storepass"
+            } else {
+                Write-Host "    keytool alias ${alias}: failed"
+            }
+        } catch [System.UnauthorizedAccessException] {
+            Write-Host "    keytool: access denied - rerun as Administrator to patch $cacerts"
+        } catch {
+            Write-Host "    keytool: error - $_"
+        } finally {
+            if (Test-Path $tmp) { Remove-Item $tmp -Force }
+        }
+    }
+}
+
 Write-Host ""
-Write-Host "Done. Replay script: $configuredToolsFile"
+Write-Host "Java installations:"
+$allJDKs = @(Get-AllJDKs)
+if ($allJDKs.Count -gt 0) {
+    foreach ($entry in $allJDKs) { Configure-JavaSSL $entry[0] $entry[1] }
+} else {
+    Write-Host "  No Java installations found"
+}
+
+# ─── VS Code ──────────────────────────────────────────────────────────────────
+
+Write-Host ""
+Write-Host "VS Code:"
+@(
+    @{ Dir = "$env:APPDATA\Code\User";           Edition = 'VS Code' }
+    @{ Dir = "$env:APPDATA\Code - Insiders\User"; Edition = 'VS Code Insiders' }
+) | ForEach-Object {
+    $settingsDir  = $_.Dir
+    $edition      = $_.Edition
+    $settingsFile = Join-Path $settingsDir 'settings.json'
+    if (-not (Test-Path $settingsDir)) { return }
+    try {
+        if (Test-Path $settingsFile) {
+            $settings = Get-Content $settingsFile -Raw | ConvertFrom-Json
+        } else {
+            $settings = New-Object PSObject
+        }
+        if ($settings.PSObject.Properties['http.systemCertificates'] -and
+            $settings.'http.systemCertificates' -eq $true) {
+            Write-Host "  ${edition}: already configured"
+        } else {
+            $settings | Add-Member -NotePropertyName 'http.systemCertificates' -NotePropertyValue $true -Force
+            $settings | ConvertTo-Json -Depth 10 | Set-Content $settingsFile -Encoding UTF8
+            Write-Host "  ${edition}: configured"
+            Add-Replay "# VS Code: set http.systemCertificates in $settingsFile"
+        }
+    } catch {
+        Write-Host "  ${edition}: failed - $_"
+    }
+}
+if (-not (Test-Path "$env:APPDATA\Code\User") -and -not (Test-Path "$env:APPDATA\Code - Insiders\User")) {
+    Write-Host "  VS Code is not installed"
+}
+
+# ─── .NET / NuGet ─────────────────────────────────────────────────────────────
+
+Write-Host ""
+Write-Host ".NET / NuGet:"
+$dotnetFound = $false
+@('dotnet','nuget') | ForEach-Object {
+    if (Test-Cmd $_) {
+        $ver = (& $_ --version 2>$null)
+        Write-Host "  $_ $ver is installed - covered by Windows Certificate Store"
+        Add-Replay "# ${_}: covered by Windows Certificate Store"
+        $dotnetFound = $true
+    }
+}
+if (-not $dotnetFound) { Write-Host "  .NET / NuGet is not installed" }
+
+# ─── Docker Desktop ───────────────────────────────────────────────────────────
+
+Write-Host ""
+Write-Host "Docker Desktop:"
+$dockerInstalled = (Test-Cmd 'docker') -or (Test-Path "$env:LOCALAPPDATA\Docker\Desktop")
+if (-not $dockerInstalled) {
+    Write-Host "  Docker is not installed"
+} else {
+    $dockerDir = Join-Path $env:USERPROFILE '.docker'
+    $dockerCa  = Join-Path $dockerDir 'ca.pem'
+    $alreadyOk = $false
+    if (Test-Path $dockerCa) {
+        $alreadyOk = ((Get-FileHash $dockerCa).Hash -eq (Get-FileHash $certPath).Hash)
+    }
+    if ($alreadyOk) {
+        Write-Host "  already configured"
+    } else {
+        if (-not (Test-Path $dockerDir)) { New-Item -ItemType Directory $dockerDir -Force | Out-Null }
+        try {
+            Copy-Item $certPath $dockerCa -Force
+            Write-Host "  configured ($dockerCa)"
+            Write-Host "  Note: restart Docker Desktop to apply changes"
+            Add-Replay "Copy-Item -Path `"$certPath`" -Destination `"$dockerCa`" -Force"
+        } catch [System.UnauthorizedAccessException] {
+            Write-Host "  access denied - could not write to $dockerCa"
+        }
+    }
+}
+
+Write-Host ""
+if ($createReplay) { Write-Host "Done. Replay script: $configuredToolsFile" }
+else { Write-Host "Done." }
 
 # ─── How to add a new tool ────────────────────────────────────────────────────
 # Tool that uses an environment variable:
